@@ -3,7 +3,6 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 from docxtpl import DocxTemplate
-from docx2pdf import convert
 import pikepdf
 import os
 import re
@@ -11,23 +10,17 @@ import zipfile
 import tempfile
 import sys
 import platform
+import time
 
-# 檢查是否在 Windows 環境
-is_windows = platform.system() == 'Windows'
-if is_windows:
+# --- Windows COM 設定 ---
+if os.name == 'nt':
     import pythoncom
+    import win32com.client
 
 # --- 設定頁面 ---
-st.set_page_config(page_title="CPD Cert Generator (Debug Mode)", layout="wide")
+st.set_page_config(page_title="CPD Cert Generator (Fixed)", layout="wide")
 
-st.title("🎓 HKIE CPD 證書生成器")
-st.markdown("""
-**功能說明：**
-1. 抓取活動資訊
-2. 核對 Zoom 出席名單 (可選)
-3. 生成 PDF (加密密碼為 Email) 或 Word 檔
-**注意：PDF 生成功能需要伺服器/本機已安裝 Microsoft Word。**
-""")
+st.title("⚡ HKIE CPD 證書生成器")
 
 # --- 1. 獲取活動資訊 ---
 st.header("1. 獲取活動資訊")
@@ -44,17 +37,14 @@ if st.button("抓取活動資訊"):
         response.encoding = 'utf-8' 
         soup = BeautifulSoup(response.content, 'html.parser')
         
-        # 抓取標題
         title_tag = soup.find(id="ctl00_ContentPlaceHolder1_ContentName")
         if title_tag:
             st.session_state['event_title'] = title_tag.get_text(strip=True)
         else:
             st.warning("找不到標題，請手動輸入。")
 
-        # 抓取日期時間
         dtv_tag = soup.find(id="ctl00_ContentPlaceHolder1_dtv")
         if dtv_tag:
-            # 將分號替換為空格
             raw_dtv = dtv_tag.get_text(strip=True).replace(';', ' ')
             st.session_state['event_details'] = raw_dtv
         else:
@@ -90,7 +80,6 @@ def normalize_name(name):
     return " ".join(name.split())
 
 def find_header_row(df_preview, keywords=["User Name", "Email"]):
-    """自動尋找 Zoom 報告的標題列"""
     for i, row in df_preview.iterrows():
         row_str_list = [str(val) for val in row.values]
         if all(any(kw in cell for cell in row_str_list) for kw in keywords):
@@ -112,21 +101,33 @@ if reg_file and template_file:
             else:
                 df_reg = pd.read_excel(reg_file)
             
-            # 欄位映射
+            # --- 強化的欄位對應邏輯 ---
             col_map = {}
             for c in df_reg.columns:
-                if 'First Name' in c: col_map[c] = 'First Name'
-                elif 'Last Name' in c: col_map[c] = 'Last Name'
-                elif 'Email Address' in c: col_map[c] = 'Email'
-                elif 'Membership No' in c: col_map[c] = 'Membership No'
-                elif 'Salutation' in c: col_map[c] = 'Salutation'
+                c_lower = str(c).lower()
+                if 'first name' in c_lower or '名字' in c_lower:
+                    col_map[c] = 'First Name'
+                elif 'last name' in c_lower or '姓氏' in c_lower:
+                    col_map[c] = 'Last Name'
+                elif 'email' in c_lower or '電郵' in c_lower:
+                    col_map[c] = 'Email'
+                elif 'membership' in c_lower or '會員編號' in c_lower: # 包含 "Membership" 或 "會員編號"
+                    col_map[c] = 'Membership No'
+                elif 'salutation' in c_lower or '稱呼' in c_lower:
+                    col_map[c] = 'Salutation'
             
             df_reg.rename(columns=col_map, inplace=True)
             
-            # 檢查必要欄位
+            # 檢查是否成功抓到 Membership No
+            if 'Membership No' not in df_reg.columns:
+                st.warning("⚠️ 警告：無法自動識別 'Membership No' 欄位。這可能導致證書上的會員編號為空白。請檢查 Excel 標題是否包含 'Membership' 或 '會員編號'。")
+                # 嘗試建立一個空的欄位以防報錯
+                df_reg['Membership No'] = ""
+            
             required_cols = ['First Name', 'Last Name', 'Email']
             if not all(col in df_reg.columns for col in required_cols):
-                st.error(f"報名表缺少必要欄位，請檢查: {required_cols}")
+                st.error(f"報名表缺少必要欄位: {required_cols}")
+                st.write("目前偵測到的欄位:", df_reg.columns.tolist())
                 st.stop()
 
             # B. 核對 Zoom
@@ -135,7 +136,6 @@ if reg_file and template_file:
                 df_final['Full Name'] = df_final['First Name'].astype(str) + " " + df_final['Last Name'].astype(str)
                 df_final['Match Method'] = "Registration Only"
             else:
-                # 預讀
                 if zoom_file.name.endswith('.csv'):
                     df_preview = pd.read_csv(zoom_file, header=None, nrows=20)
                 else:
@@ -143,7 +143,6 @@ if reg_file and template_file:
                 
                 header_row = find_header_row(df_preview)
                 
-                # 重新讀取
                 zoom_file.seek(0)
                 if zoom_file.name.endswith('.csv'):
                     df_zoom = pd.read_csv(zoom_file, header=header_row)
@@ -160,7 +159,6 @@ if reg_file and template_file:
                 if 'Attended' in df_zoom.columns:
                     df_zoom = df_zoom[df_zoom['Attended'] == 'Yes']
 
-                # 配對
                 st.write("正在核對 Zoom 資料...")
                 df_reg['Name_Norm'] = (df_reg['First Name'].astype(str) + " " + df_reg['Last Name'].astype(str)).apply(normalize_name)
                 df_reg['Email_Norm'] = df_reg['Email'].astype(str).str.lower().str.strip()
@@ -191,7 +189,9 @@ if reg_file and template_file:
 
             if not df_final.empty:
                 st.success(f"共產生 {len(df_final)} 筆證書名單。")
-                st.dataframe(df_final.head())
+                # 顯示前幾筆資料供檢查
+                st.write("預覽將生成的資料 (請確認 Membership No 是否有值):")
+                st.dataframe(df_final[['Salutation', 'Full Name', 'Membership No', 'Email']].head())
             else:
                 st.warning("沒有符合的名單。")
 
@@ -218,82 +218,98 @@ if reg_file and template_file:
                 zip_path = os.path.join(tmpdirname, zip_filename)
                 template_path = os.path.join(tmpdirname, "template.docx")
                 
-                # 儲存範本
                 with open(template_path, "wb") as f:
                     f.write(template_file.getbuffer())
                 
                 generated_files = []
                 total = len(df_final)
                 success_count = 0
-                error_shown = False # 避免重複顯示相同的 PDF 錯誤
                 
-                for i, person in df_final.iterrows():
-                    person_name = str(person['Full Name']).strip()
-                    status_text.text(f"處理中 ({i+1}/{total}): {person_name}")
-                    
-                    # 1. 產生 Word
+                # PDF 批次處理初始化
+                word = None
+                if output_format.startswith('PDF') and os.name == 'nt':
                     try:
-                        doc = DocxTemplate(template_path)
-                        mem_no = str(person['Membership No'])
-                        if mem_no == 'nan' or mem_no == 'None': mem_no = ""
-                        
-                        context = {
-                            'name': f"{person['Salutation']} {person_name}",
-                            'membership_number': mem_no, 
-                            'event_title': event_title,
-                            'event_details': event_details
-                        }
-                        doc.render(context)
-                        
-                        safe_name = re.sub(r'[\\/*?:"<>|]', "", person_name)
-                        docx_filename = f"{safe_name}.docx"
-                        docx_path = os.path.join(tmpdirname, docx_filename)
-                        doc.save(docx_path)
-                        
-                        final_file_path = docx_path
-                        
-                        # 2. 轉 PDF
-                        if output_format.startswith('PDF'):
-                            try:
-                                pdf_filename = f"{safe_name}.pdf"
-                                pdf_path = os.path.join(tmpdirname, pdf_filename)
-                                
-                                # Windows COM 初始化
-                                if is_windows:
-                                    pythoncom.CoInitialize()
-                                
-                                # 嘗試轉換 (如果沒有安裝 Word，這裡會報錯)
-                                convert(docx_path, pdf_path)
-                                
-                                # 加密
-                                password = str(person['Email']).strip()
-                                if not password or password == 'nan':
-                                    password = "hkie"
-                                    
-                                encrypted_path = os.path.join(tmpdirname, f"Encrypted_{safe_name}.pdf")
-                                with pikepdf.Pdf.open(pdf_path) as pdf:
-                                    pdf.save(encrypted_path, encryption=pikepdf.Encryption(owner=password, user=password, R=6))
-                                
-                                final_file_path = encrypted_path
-                                
-                            except Exception as e_pdf:
-                                # PDF 失敗時，顯示錯誤但不中斷，回退到 Word
-                                if not error_shown:
-                                    st.error(f"⚠️ PDF 轉換失敗 (僅顯示一次，後續將自動轉為 Word): {e_pdf}")
-                                    st.warning("可能原因：伺服器未安裝 Microsoft Word，或 COM 元件呼叫失敗。")
-                                    error_shown = True
-                                final_file_path = docx_path
-                        
-                        generated_files.append(final_file_path)
-                        success_count += 1
-                        
+                        pythoncom.CoInitialize()
+                        word = win32com.client.DispatchEx("Word.Application")
+                        word.Visible = False
+                        word.DisplayAlerts = False
                     except Exception as e:
-                        st.error(f"生成 {person_name} 時發生嚴重錯誤: {e}")
-                        if "expected token" in str(e):
-                            st.error("❌ 請檢查 Word 範本變數名稱 (不能有空格)。")
-                            st.stop()
+                        st.error(f"無法啟動 Word: {e}")
+                        st.stop()
+                
+                try:
+                    for i, person in df_final.iterrows():
+                        person_name = str(person['Full Name']).strip()
+                        status_text.text(f"處理中 ({i+1}/{total}): {person_name}")
+                        
+                        try:
+                            # 1. 產生 DOCX
+                            doc_tpl = DocxTemplate(template_path)
+                            
+                            # 處理 Membership No (避免 NaN 或 .0)
+                            mem_no = str(person['Membership No'])
+                            if mem_no.lower() in ['nan', 'none', '']: 
+                                mem_no = ""
+                            if mem_no.endswith('.0'): # 去除 Excel 數字轉字串可能出現的 .0
+                                mem_no = mem_no[:-2]
 
-                    progress_bar.progress((i + 1) / total)
+                            # 建立變數對應 (Context)
+                            # 注意：這裡使用 membership_no 對應新範本
+                            context = {
+                                'name': f"{person['Salutation']} {person_name}",
+                                'membership_no': mem_no,  # 對應 Word 中的 {{ membership_no }}
+                                'event_title': event_title,
+                                'event_details': event_details
+                            }
+                            doc_tpl.render(context)
+                            
+                            safe_name = re.sub(r'[\\/*?:"<>|]', "", person_name)
+                            docx_filename = f"{safe_name}.docx"
+                            docx_path = os.path.join(tmpdirname, docx_filename)
+                            doc_tpl.save(docx_path)
+                            
+                            final_file_path = docx_path
+                            
+                            # 2. 轉 PDF (若需要)
+                            if word:
+                                try:
+                                    pdf_filename = f"{safe_name}.pdf"
+                                    pdf_path = os.path.join(tmpdirname, pdf_filename)
+                                    
+                                    wb_doc = word.Documents.Open(os.path.abspath(docx_path))
+                                    wb_doc.SaveAs(os.path.abspath(pdf_path), FileFormat=17)
+                                    wb_doc.Close(SaveChanges=False)
+                                    
+                                    password = str(person['Email']).strip()
+                                    if not password or password == 'nan':
+                                        password = "hkie"
+                                        
+                                    encrypted_path = os.path.join(tmpdirname, f"Encrypted_{safe_name}.pdf")
+                                    with pikepdf.Pdf.open(pdf_path) as pdf:
+                                        pdf.save(encrypted_path, encryption=pikepdf.Encryption(owner=password, user=password, R=6))
+                                    
+                                    final_file_path = encrypted_path
+                                except Exception as e:
+                                    # st.warning(f"{person_name} 轉檔失敗: {e}")
+                                    final_file_path = docx_path
+                            
+                            generated_files.append(final_file_path)
+                            success_count += 1
+                            
+                        except Exception as e:
+                            st.error(f"生成 {person_name} 時錯誤: {e}")
+                            if "expected token" in str(e):
+                                st.stop()
+
+                        progress_bar.progress((i + 1) / total)
+                        
+                finally:
+                    if word:
+                        try:
+                            word.Quit()
+                        except:
+                            pass
+                        pythoncom.CoUninitialize()
                 
                 if generated_files:
                     with zipfile.ZipFile(zip_path, 'w') as zipf:

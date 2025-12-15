@@ -5,3 +5,4 @@ docx2pdf
 pikepdf
 openpyxl
 pywin32
+bs4
