@@ -1,0 +1,7 @@
+streamlit
+pandas
+docxtpl
+docx2pdf
+pikepdf
+openpyxl
+pywin32
