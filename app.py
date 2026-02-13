@@ -11,6 +11,7 @@ import tempfile
 import sys
 import platform
 import time
+from io import StringIO
 
 # --- Windows COM 設定 ---
 if os.name == 'nt':
@@ -18,7 +19,7 @@ if os.name == 'nt':
     import win32com.client
 
 # --- 設定頁面 ---
-st.set_page_config(page_title="CPD Cert Generator (Fixed)", layout="wide")
+st.set_page_config(page_title="CPD Cert Generator", layout="wide")
 
 st.title("⚡ HKIE CPD 證書生成器")
 
@@ -79,53 +80,80 @@ def normalize_name(name):
     name = re.sub(r'[^a-z\s]', '', name)
     return " ".join(name.split())
 
-def find_header_row(df_preview, keywords=["User Name", "Email"]):
-    """找到包含所有關鍵字的標題行"""
-    for i, row in df_preview.iterrows():
-        row_str_list = [str(val) for val in row.values]
-        if all(any(kw in cell for cell in row_str_list) for kw in keywords):
-            return i
-    return 0
+def parse_zoom_report(file_obj):
+    """Parse Zoom attendee report (CSV or Excel).
+    Handles multi-section format, trailing commas, and multiple join/leave entries.
+    Returns (DataFrame, error_msg). error_msg is None on success."""
+    is_csv = hasattr(file_obj, 'name') and file_obj.name.endswith('.csv')
 
-def find_attendee_section_in_zoom(file_path_or_obj):
-    """專門處理 Zoom 報告，找到 Attendee Details 區域的標題行"""
-    # 讀取整個文件內容
-    if hasattr(file_path_or_obj, 'seek'):
-        file_path_or_obj.seek(0)
-    
-    if hasattr(file_path_or_obj, 'read'):
-        content = file_path_or_obj.read()
-        if isinstance(content, bytes):
-            content = content.decode('utf-8-sig', errors='ignore')
+    if hasattr(file_obj, 'seek'):
+        file_obj.seek(0)
+
+    if is_csv:
+        # Read raw content for manual section detection
+        if hasattr(file_obj, 'read'):
+            content = file_obj.read()
+            if isinstance(content, bytes):
+                content = content.decode('utf-8-sig', errors='ignore')
         else:
-            content = str(content)
-    else:
-        with open(file_path_or_obj, 'r', encoding='utf-8-sig', errors='ignore') as f:
-            content = f.read()
-    
-    lines = content.split('\n')
-    
-    # 找到 "Attendee Details" 行
-    attendee_section_idx = -1
-    for i, line in enumerate(lines):
-        if 'Attendee Details' in line:
-            attendee_section_idx = i
-            break
-    
-    if attendee_section_idx == -1:
-        # 如果找不到 Attendee Details，嘗試找包含 "User Name" 和 "Email" 的行
+            with open(file_obj, 'r', encoding='utf-8-sig', errors='ignore') as f:
+                content = f.read()
+
+        lines = content.split('\n')
+
+        # Locate the "Attendee Details" section header row
+        header_idx = -1
         for i, line in enumerate(lines):
-            if 'User Name' in line and 'Email' in line and 'Join Time' in line:
-                return i
-        return 0  # 找不到，回傳預設值
-    
-    # Attendee Details 的下一行應該是標題行
-    # 找到包含 "User Name" 和 "Email" 的那一行
-    for i in range(attendee_section_idx + 1, min(attendee_section_idx + 5, len(lines))):
-        if 'User Name' in lines[i] and 'Email' in lines[i]:
-            return i
-    
-    return attendee_section_idx + 1  # 預設為 Attendee Details 的下一行
+            if 'Attendee Details' in line:
+                for j in range(i + 1, min(i + 5, len(lines))):
+                    if 'User Name' in lines[j] and 'Email' in lines[j]:
+                        header_idx = j
+                        break
+                if header_idx == -1 and i + 1 < len(lines):
+                    header_idx = i + 1
+                break
+
+        if header_idx == -1:
+            # Fallback: find any row with expected columns
+            for i, line in enumerate(lines):
+                if 'User Name' in line and 'Email' in line and 'Join Time' in line:
+                    header_idx = i
+                    break
+
+        if header_idx == -1:
+            return None, "Cannot find Attendee Details section in Zoom report"
+
+        # Extract header + data lines; strip trailing commas that create ghost columns
+        attendee_lines = []
+        for i in range(header_idx, len(lines)):
+            stripped = lines[i].strip()
+            if not stripped:
+                continue
+            if stripped.endswith(','):
+                stripped = stripped[:-1]
+            attendee_lines.append(stripped)
+
+        if len(attendee_lines) < 2:
+            return None, "No attendee data found after header"
+
+        csv_text = '\n'.join(attendee_lines)
+        df = pd.read_csv(StringIO(csv_text), skipinitialspace=True)
+    else:
+        # Excel: scan for the header row containing expected columns
+        df_raw = pd.read_excel(file_obj, header=None)
+        header_idx = 0
+        for i, row in df_raw.iterrows():
+            row_vals = [str(v) for v in row.values]
+            if any('User Name' in v for v in row_vals) and any('Email' in v for v in row_vals):
+                header_idx = i
+                break
+        if hasattr(file_obj, 'seek'):
+            file_obj.seek(0)
+        df = pd.read_excel(file_obj, header=header_idx)
+
+    # Drop completely empty columns (artefact of trailing commas)
+    df = df.dropna(axis=1, how='all')
+    return df, None
 
 # --- 3. 數據處理 ---
 df_final = pd.DataFrame()
@@ -201,65 +229,37 @@ if reg_file and template_file:
                 df_final['Full Name'] = df_final['First Name'].astype(str) + " " + df_final['Last Name'].astype(str)
                 df_final['Match Method'] = "Registration Only"
             else:
-                # 使用新的 Zoom 解析方法
-                header_row = find_attendee_section_in_zoom(zoom_file)
-                st.write(f"🔍 Zoom 檔案標題行位置: {header_row}")
-                
-                zoom_file.seek(0)
-                if zoom_file.name.endswith('.csv'):
-                    # skip_blank_lines=False 和 skipinitialspace=True 處理格式問題
-                    # 先讀取看看有多少列
-                    temp_df = pd.read_csv(zoom_file, header=header_row, encoding='utf-8-sig', 
-                                         on_bad_lines='skip', nrows=5)
-                    st.write(f"🔍 臨時讀取前5行檢查欄位: {temp_df.columns.tolist()}")
-                    st.write(f"🔍 第一行資料樣本:")
-                    st.dataframe(temp_df.head(1))
-                    
-                    # 重新讀取完整資料，使用 skipinitialspace 去除多餘空格
-                    zoom_file.seek(0)
-                    df_zoom = pd.read_csv(zoom_file, header=header_row, encoding='utf-8-sig', 
-                                         on_bad_lines='skip', skipinitialspace=True)
-                else:
-                    df_zoom = pd.read_excel(zoom_file, header=header_row)
-                
+                # Parse Zoom attendee report
+                df_zoom, zoom_err = parse_zoom_report(zoom_file)
+                if zoom_err:
+                    st.error(f"Zoom 檔案解析失敗: {zoom_err}")
+                    st.stop()
+
                 st.write(f"📊 Zoom 檔案欄位: {df_zoom.columns.tolist()}")
                 st.write(f"📈 Zoom 原始資料筆數: {len(df_zoom)}")
-                
-                # 檢查是否有欄位錯位問題 - 如果 Attended 欄位包含名字而不是 Yes/No
-                if len(df_zoom) > 0:
-                    first_attended = str(df_zoom['Attended'].iloc[0]) if 'Attended' in df_zoom.columns else ""
-                    st.write(f"🔍 第一筆 Attended 值: '{first_attended}'")
-                    # 如果 Attended 不是 Yes/No，可能有欄位錯位
-                    if first_attended and first_attended.lower() not in ['yes', 'no', 'nan', '']:
-                        st.warning("⚠️ 偵測到欄位可能錯位，嘗試修正...")
-                        # 檢查是否有未命名的第一欄
-                        if df_zoom.columns[0].startswith('Unnamed'):
-                            st.write("發現未命名的第一欄，移除它")
-                            df_zoom = df_zoom.iloc[:, 1:]  # 移除第一欄
-                        # 或者檢查第二欄是否才是真正的 Attended
-                        elif 'Attended' not in df_zoom.columns and len(df_zoom.columns) > 1:
-                            # 嘗試使用第一列資料作為欄位名
-                            st.write("嘗試重新解析欄位...")
-                
-                st.write(f"📊 修正後欄位: {df_zoom.columns.tolist()}")
-                
+
                 z_user_col = next((c for c in df_zoom.columns if "User Name" in str(c)), None)
                 z_email_col = next((c for c in df_zoom.columns if "Email" in str(c)), None)
-                
+
                 if not z_user_col or not z_email_col:
                     st.error("Zoom 檔案無法識別 User Name 或 Email 欄位。")
                     st.write("偵測到的欄位:", df_zoom.columns.tolist())
                     st.stop()
-                
-                st.write(f"✅ User Name 欄位: {z_user_col}")
-                st.write(f"✅ Email 欄位: {z_email_col}")
-                
-                # 不過濾 Attended，因為這個檔案本身就是 Attendee Report
-                st.write(f"ℹ️ 使用所有記錄 (此檔案為出席者報告)")
-                
-                # 去除重複的 Email (保留第一筆)
-                df_zoom = df_zoom.drop_duplicates(subset=[z_email_col], keep='first')
-                st.write(f"✓ 去除重複後: {len(df_zoom)} 筆")
+
+                # Aggregate total time in session per attendee (handles re-joins)
+                z_time_col = next((c for c in df_zoom.columns if "Time in Session" in str(c)), None)
+                if z_time_col:
+                    df_zoom[z_time_col] = pd.to_numeric(df_zoom[z_time_col], errors='coerce').fillna(0)
+                    time_agg = df_zoom.groupby(z_email_col, as_index=False)[z_time_col].sum()
+                    time_agg.rename(columns={z_time_col: '_total_time'}, inplace=True)
+                    df_zoom = df_zoom.drop_duplicates(subset=[z_email_col], keep='first')
+                    df_zoom = df_zoom.merge(time_agg, on=z_email_col, how='left')
+                    df_zoom[z_time_col] = df_zoom['_total_time']
+                    df_zoom.drop(columns=['_total_time'], inplace=True)
+                else:
+                    df_zoom = df_zoom.drop_duplicates(subset=[z_email_col], keep='first')
+
+                st.write(f"✅ 去除重複後 (已合計出席時間): {len(df_zoom)} 位出席者")
 
                 st.write("正在核對 Zoom 資料...")
                 df_reg['Name_Norm'] = (df_reg['First Name'].astype(str) + " " + df_reg['Last Name'].astype(str)).apply(normalize_name)
@@ -330,7 +330,7 @@ if reg_file and template_file:
     
     output_format = st.radio(
         "選擇輸出格式：",
-        ('Word 文件 (.docx) - 不加密', 'PDF 文件 (.pdf) - 加密 (密碼: Email)')
+        ('Word 文件 (.docx) - 不加密', 'PDF 文件 (.pdf) - 加密 (密碼: Membership No.)')
     )
     
     if st.button("開始生成"):
