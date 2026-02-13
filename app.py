@@ -12,34 +12,15 @@ import sys
 import platform
 import time
 
-# --- 自動偵測作業系統 ---
-current_os = platform.system()
-is_windows = current_os == 'Windows'
-is_mac = current_os == 'Darwin'
-
-# 根據 OS 載入對應的轉檔工具
-if is_windows:
+# --- Windows COM 設定 ---
+if os.name == 'nt':
     import pythoncom
     import win32com.client
-elif is_mac:
-    # Mac 需要 docx2pdf
-    try:
-        from docx2pdf import convert as mac_convert
-    except ImportError:
-        pass
 
 # --- 設定頁面 ---
-st.set_page_config(page_title="CPD Cert Generator", layout="wide")
+st.set_page_config(page_title="CPD Cert Generator (Fixed)", layout="wide")
 
 st.title("⚡ HKIE CPD 證書生成器")
-
-# 顯示當前系統狀態
-if is_mac:
-    st.info("🍎 偵測到 macOS 環境：使用 docx2pdf 進行轉檔。")
-elif is_windows:
-    st.info("🪟 偵測到 Windows 環境：使用 Win32 COM 極速引擎進行轉檔。")
-else:
-    st.warning("⚠️ 偵測到 Linux/其他環境：僅支援生成 Word 檔，無法生成 PDF。")
 
 # --- 1. 獲取活動資訊 ---
 st.header("1. 獲取活動資訊")
@@ -82,13 +63,13 @@ with col2:
 # --- 2. 上傳檔案 ---
 st.header("2. 上傳資料檔")
 
-reg_file = st.file_uploader("上傳報名表 (Registration Excel) [必填]", type=['xlsx', 'csv'])
+reg_file = st.file_uploader("上傳報名表 (Registration Excel) [必填]", type=['csv', 'xlsx'])
 template_file = st.file_uploader("上傳證書範本 (Word .docx) [必填]", type=['docx'])
 
 use_zoom = st.checkbox("需要核對 Zoom 出席紀錄？", value=True)
 zoom_file = None
 if use_zoom:
-    zoom_file = st.file_uploader("上傳 Zoom 報告 (Attendee Excel) [選填]", type=['xlsx', 'csv'])
+    zoom_file = st.file_uploader("上傳 Zoom 報告 (Attendee Excel) [選填]", type=['csv', 'xlsx'])
 
 # --- 輔助函式 ---
 def normalize_name(name):
@@ -99,19 +80,52 @@ def normalize_name(name):
     return " ".join(name.split())
 
 def find_header_row(df_preview, keywords=["User Name", "Email"]):
+    """找到包含所有關鍵字的標題行"""
     for i, row in df_preview.iterrows():
         row_str_list = [str(val) for val in row.values]
         if all(any(kw in cell for cell in row_str_list) for kw in keywords):
             return i
     return 0
 
-def load_data(uploaded_file):
-    try:
-        uploaded_file.seek(0)
-        return pd.read_excel(uploaded_file)
-    except:
-        uploaded_file.seek(0)
-        return pd.read_csv(uploaded_file)
+def find_attendee_section_in_zoom(file_path_or_obj):
+    """專門處理 Zoom 報告，找到 Attendee Details 區域的標題行"""
+    # 讀取整個文件內容
+    if hasattr(file_path_or_obj, 'seek'):
+        file_path_or_obj.seek(0)
+    
+    if hasattr(file_path_or_obj, 'read'):
+        content = file_path_or_obj.read()
+        if isinstance(content, bytes):
+            content = content.decode('utf-8-sig', errors='ignore')
+        else:
+            content = str(content)
+    else:
+        with open(file_path_or_obj, 'r', encoding='utf-8-sig', errors='ignore') as f:
+            content = f.read()
+    
+    lines = content.split('\n')
+    
+    # 找到 "Attendee Details" 行
+    attendee_section_idx = -1
+    for i, line in enumerate(lines):
+        if 'Attendee Details' in line:
+            attendee_section_idx = i
+            break
+    
+    if attendee_section_idx == -1:
+        # 如果找不到 Attendee Details，嘗試找包含 "User Name" 和 "Email" 的行
+        for i, line in enumerate(lines):
+            if 'User Name' in line and 'Email' in line and 'Join Time' in line:
+                return i
+        return 0  # 找不到，回傳預設值
+    
+    # Attendee Details 的下一行應該是標題行
+    # 找到包含 "User Name" 和 "Email" 的那一行
+    for i in range(attendee_section_idx + 1, min(attendee_section_idx + 5, len(lines))):
+        if 'User Name' in lines[i] and 'Email' in lines[i]:
+            return i
+    
+    return attendee_section_idx + 1  # 預設為 Attendee Details 的下一行
 
 # --- 3. 數據處理 ---
 df_final = pd.DataFrame()
@@ -123,28 +137,57 @@ if reg_file and template_file:
         st.header("3. 處理名單")
         try:
             # A. 讀取報名表
-            df_reg = load_data(reg_file)
+            if reg_file.name.endswith('.csv'):
+                df_reg = pd.read_csv(reg_file)
+            else:
+                df_reg = pd.read_excel(reg_file)
             
-            # 欄位對應
+            # --- 強化的欄位對應邏輯 ---
             col_map = {}
+            has_full_name = False
+            
             for c in df_reg.columns:
-                c_lower = str(c).lower()
-                if 'first name' in c_lower or '名字' in c_lower:
+                c_lower = str(c).lower().strip()
+                if 'full name' in c_lower:
+                    col_map[c] = 'Full Name'
+                    has_full_name = True
+                elif 'first name' in c_lower or '名字' in c_lower:
                     col_map[c] = 'First Name'
                 elif 'last name' in c_lower or '姓氏' in c_lower:
                     col_map[c] = 'Last Name'
+                elif 'contact email' in c_lower:
+                    col_map[c] = 'Email'
                 elif 'email' in c_lower or '電郵' in c_lower:
                     col_map[c] = 'Email'
-                elif 'membership' in c_lower or '會員編號' in c_lower:
+                elif 'hkie membership' in c_lower or 'membership no' in c_lower or '會員編號' in c_lower:
                     col_map[c] = 'Membership No'
                 elif 'salutation' in c_lower or '稱呼' in c_lower:
                     col_map[c] = 'Salutation'
             
             df_reg.rename(columns=col_map, inplace=True)
             
+            # 如果有 Full Name 但沒有 First Name / Last Name，需要拆分
+            if has_full_name and 'Full Name' in df_reg.columns:
+                if 'First Name' not in df_reg.columns or 'Last Name' not in df_reg.columns:
+                    # 拆分 Full Name 為 First Name 和 Last Name
+                    name_split = df_reg['Full Name'].astype(str).str.strip().str.split(n=1, expand=True)
+                    if name_split.shape[1] == 2:
+                        df_reg['First Name'] = name_split[0]
+                        df_reg['Last Name'] = name_split[1]
+                    else:
+                        # 如果只有一個詞，全部當作 First Name
+                        df_reg['First Name'] = name_split[0]
+                        df_reg['Last Name'] = ""
+            
+            # 檢查是否成功抓到 Membership No
             if 'Membership No' not in df_reg.columns:
-                st.warning("⚠️ 警告：無法自動識別 'Membership No' 欄位。")
+                st.warning("⚠️ 警告：無法自動識別 'Membership No' 欄位。這可能導致證書上的會員編號為空白。請檢查 Excel 標題是否包含 'Membership' 或 '會員編號'。")
+                # 嘗試建立一個空的欄位以防報錯
                 df_reg['Membership No'] = ""
+            
+            # 如果沒有 Salutation 欄位，建立一個空的
+            if 'Salutation' not in df_reg.columns:
+                df_reg['Salutation'] = ""
             
             required_cols = ['First Name', 'Last Name', 'Email']
             if not all(col in df_reg.columns for col in required_cols):
@@ -152,42 +195,71 @@ if reg_file and template_file:
                 st.write("目前偵測到的欄位:", df_reg.columns.tolist())
                 st.stop()
 
-            # --- [新增功能 1] 顯示報名表 Email 清單 ---
-            st.info(f"📄 已成功讀取報名表，共 {len(df_reg)} 筆資料。")
-            with st.expander("🔍 點擊查看原始報名名單 (Email List)"):
-                st.dataframe(df_reg[['First Name', 'Last Name', 'Email', 'Membership No']])
-
             # B. 核對 Zoom
             if not use_zoom:
                 df_final = df_reg.copy()
                 df_final['Full Name'] = df_final['First Name'].astype(str) + " " + df_final['Last Name'].astype(str)
                 df_final['Match Method'] = "Registration Only"
             else:
-                # Zoom 處理
-                try:
-                    zoom_file.seek(0)
-                    df_preview = pd.read_csv(zoom_file, header=None, nrows=20)
-                except:
-                    zoom_file.seek(0)
-                    df_preview = pd.read_excel(zoom_file, header=None, nrows=20)
-                
-                header_row = find_header_row(df_preview)
+                # 使用新的 Zoom 解析方法
+                header_row = find_attendee_section_in_zoom(zoom_file)
+                st.write(f"🔍 Zoom 檔案標題行位置: {header_row}")
                 
                 zoom_file.seek(0)
-                try:
-                    df_zoom = pd.read_csv(zoom_file, header=header_row)
-                except:
+                if zoom_file.name.endswith('.csv'):
+                    # skip_blank_lines=False 和 skipinitialspace=True 處理格式問題
+                    # 先讀取看看有多少列
+                    temp_df = pd.read_csv(zoom_file, header=header_row, encoding='utf-8-sig', 
+                                         on_bad_lines='skip', nrows=5)
+                    st.write(f"🔍 臨時讀取前5行檢查欄位: {temp_df.columns.tolist()}")
+                    st.write(f"🔍 第一行資料樣本:")
+                    st.dataframe(temp_df.head(1))
+                    
+                    # 重新讀取完整資料，使用 skipinitialspace 去除多餘空格
+                    zoom_file.seek(0)
+                    df_zoom = pd.read_csv(zoom_file, header=header_row, encoding='utf-8-sig', 
+                                         on_bad_lines='skip', skipinitialspace=True)
+                else:
                     df_zoom = pd.read_excel(zoom_file, header=header_row)
+                
+                st.write(f"📊 Zoom 檔案欄位: {df_zoom.columns.tolist()}")
+                st.write(f"📈 Zoom 原始資料筆數: {len(df_zoom)}")
+                
+                # 檢查是否有欄位錯位問題 - 如果 Attended 欄位包含名字而不是 Yes/No
+                if len(df_zoom) > 0:
+                    first_attended = str(df_zoom['Attended'].iloc[0]) if 'Attended' in df_zoom.columns else ""
+                    st.write(f"🔍 第一筆 Attended 值: '{first_attended}'")
+                    # 如果 Attended 不是 Yes/No，可能有欄位錯位
+                    if first_attended and first_attended.lower() not in ['yes', 'no', 'nan', '']:
+                        st.warning("⚠️ 偵測到欄位可能錯位，嘗試修正...")
+                        # 檢查是否有未命名的第一欄
+                        if df_zoom.columns[0].startswith('Unnamed'):
+                            st.write("發現未命名的第一欄，移除它")
+                            df_zoom = df_zoom.iloc[:, 1:]  # 移除第一欄
+                        # 或者檢查第二欄是否才是真正的 Attended
+                        elif 'Attended' not in df_zoom.columns and len(df_zoom.columns) > 1:
+                            # 嘗試使用第一列資料作為欄位名
+                            st.write("嘗試重新解析欄位...")
+                
+                st.write(f"📊 修正後欄位: {df_zoom.columns.tolist()}")
                 
                 z_user_col = next((c for c in df_zoom.columns if "User Name" in str(c)), None)
                 z_email_col = next((c for c in df_zoom.columns if "Email" in str(c)), None)
                 
                 if not z_user_col or not z_email_col:
                     st.error("Zoom 檔案無法識別 User Name 或 Email 欄位。")
+                    st.write("偵測到的欄位:", df_zoom.columns.tolist())
                     st.stop()
                 
-                if 'Attended' in df_zoom.columns:
-                    df_zoom = df_zoom[df_zoom['Attended'] == 'Yes']
+                st.write(f"✅ User Name 欄位: {z_user_col}")
+                st.write(f"✅ Email 欄位: {z_email_col}")
+                
+                # 不過濾 Attended，因為這個檔案本身就是 Attendee Report
+                st.write(f"ℹ️ 使用所有記錄 (此檔案為出席者報告)")
+                
+                # 去除重複的 Email (保留第一筆)
+                df_zoom = df_zoom.drop_duplicates(subset=[z_email_col], keep='first')
+                st.write(f"✓ 去除重複後: {len(df_zoom)} 筆")
 
                 st.write("正在核對 Zoom 資料...")
                 df_reg['Name_Norm'] = (df_reg['First Name'].astype(str) + " " + df_reg['Last Name'].astype(str)).apply(normalize_name)
@@ -196,10 +268,21 @@ if reg_file and template_file:
                 df_zoom['Name_Norm'] = df_zoom[z_user_col].apply(normalize_name)
                 df_zoom['Email_Norm'] = df_zoom[z_email_col].astype(str).str.lower().str.strip()
                 
+                # 建立 Zoom 對應字典
                 zoom_email_map = df_zoom.set_index('Email_Norm')[z_user_col].to_dict()
                 zoom_name_map = df_zoom.set_index('Name_Norm')[z_user_col].to_dict()
                 
+                st.write(f"📧 Zoom Email 數量: {len(zoom_email_map)}")
+                st.write(f"👤 Zoom Name 數量: {len(zoom_name_map)}")
+                st.write(f"📝 報名表數量: {len(df_reg)}")
+                
+                # 顯示前幾筆 Zoom 資料供檢查
+                st.write("Zoom 資料預覽 (前5筆):")
+                st.dataframe(df_zoom[[z_user_col, z_email_col, 'Email_Norm']].head())
+                
                 matched_list = []
+                unmatched_list = []
+                
                 for _, row in df_reg.iterrows():
                     status = "Unmatched"
                     if row['Email_Norm'] in zoom_email_map:
@@ -215,13 +298,27 @@ if reg_file and template_file:
                             "Email": row.get('Email', ''),
                             "Match Method": status
                         })
+                    else:
+                        unmatched_list.append({
+                            "Name": f"{row.get('First Name', '')} {row.get('Last Name', '')}",
+                            "Email": row.get('Email', ''),
+                            "Email_Norm": row['Email_Norm'],
+                            "Name_Norm": row['Name_Norm']
+                        })
+                
                 df_final = pd.DataFrame(matched_list)
+                
+                # 顯示未匹配的記錄
+                if unmatched_list:
+                    st.warning(f"⚠️ {len(unmatched_list)} 筆報名記錄未在 Zoom 中找到")
+                    with st.expander("查看未匹配的記錄"):
+                        st.dataframe(pd.DataFrame(unmatched_list))
 
             if not df_final.empty:
-                st.success(f"✅ 核對完成！共產生 {len(df_final)} 筆證書名單。")
-                # --- [新增功能 2] 顯示最終 Email 清單 ---
-                with st.expander("🔍 點擊查看將獲發證書的 Email 清單 (Final List)"):
-                    st.dataframe(df_final[['Salutation', 'Full Name', 'Email', 'Membership No', 'Match Method']])
+                st.success(f"共產生 {len(df_final)} 筆證書名單。")
+                # 顯示前幾筆資料供檢查
+                st.write("預覽將生成的資料 (請確認 Membership No 是否有值):")
+                st.dataframe(df_final[['Salutation', 'Full Name', 'Membership No', 'Email']].head())
             else:
                 st.warning("沒有符合的名單。")
 
@@ -255,16 +352,16 @@ if reg_file and template_file:
                 total = len(df_final)
                 success_count = 0
                 
-                # Windows 批次初始化
-                word_app = None
-                if output_format.startswith('PDF') and is_windows:
+                # PDF 批次處理初始化
+                word = None
+                if output_format.startswith('PDF') and os.name == 'nt':
                     try:
                         pythoncom.CoInitialize()
-                        word_app = win32com.client.DispatchEx("Word.Application")
-                        word_app.Visible = False
-                        word_app.DisplayAlerts = False
+                        word = win32com.client.DispatchEx("Word.Application")
+                        word.Visible = False
+                        word.DisplayAlerts = False
                     except Exception as e:
-                        st.error(f"無法啟動 Word (Windows): {e}")
+                        st.error(f"無法啟動 Word: {e}")
                         st.stop()
                 
                 try:
@@ -276,13 +373,18 @@ if reg_file and template_file:
                             # 1. 產生 DOCX
                             doc_tpl = DocxTemplate(template_path)
                             
+                            # 處理 Membership No (避免 NaN 或 .0)
                             mem_no = str(person['Membership No'])
-                            if mem_no.lower() in ['nan', 'none', '']: mem_no = ""
-                            if mem_no.endswith('.0'): mem_no = mem_no[:-2]
+                            if mem_no.lower() in ['nan', 'none', '']: 
+                                mem_no = ""
+                            if mem_no.endswith('.0'): # 去除 Excel 數字轉字串可能出現的 .0
+                                mem_no = mem_no[:-2]
 
+                            # 建立變數對應 (Context)
+                            # 注意：這裡使用 membership_no 對應新範本
                             context = {
                                 'name': f"{person['Salutation']} {person_name}",
-                                'membership_no': mem_no, 
+                                'membership_no': mem_no,  # 對應 Word 中的 {{ membership_no }}
                                 'event_title': event_title,
                                 'event_details': event_details
                             }
@@ -295,44 +397,27 @@ if reg_file and template_file:
                             
                             final_file_path = docx_path
                             
-                            # 2. 轉 PDF
-                            if output_format.startswith('PDF'):
+                            # 2. 轉 PDF (若需要)
+                            if word:
                                 try:
                                     pdf_filename = f"{safe_name}.pdf"
-                                    # Mac 需要絕對路徑
                                     pdf_path = os.path.join(tmpdirname, pdf_filename)
-                                    abs_docx = os.path.abspath(docx_path)
-                                    abs_pdf = os.path.abspath(pdf_path)
-
-                                    # A. Windows: COM
-                                    if is_windows and word_app:
-                                        wb_doc = word_app.Documents.Open(abs_docx)
-                                        wb_doc.SaveAs(abs_pdf, FileFormat=17)
-                                        wb_doc.Close(SaveChanges=False)
                                     
-                                    # B. Mac: docx2pdf (修復這裡的邏輯)
-                                    elif is_mac:
-                                        mac_convert(abs_docx, abs_pdf)
-                                        time.sleep(0.5) # 緩衝
-
-                                    # C. 加密
-                                    password = str(person['Email']).strip()
+                                    wb_doc = word.Documents.Open(os.path.abspath(docx_path))
+                                    wb_doc.SaveAs(os.path.abspath(pdf_path), FileFormat=17)
+                                    wb_doc.Close(SaveChanges=False)
+                                    
+                                    password = str(person['Membership No']).strip()
                                     if not password or password == 'nan':
                                         password = "hkie"
                                         
                                     encrypted_path = os.path.join(tmpdirname, f"Encrypted_{safe_name}.pdf")
-                                    
-                                    # 確保檔案已生成
-                                    if not os.path.exists(abs_pdf):
-                                         raise FileNotFoundError("PDF file was not created.")
-
-                                    with pikepdf.Pdf.open(abs_pdf) as pdf:
+                                    with pikepdf.Pdf.open(pdf_path) as pdf:
                                         pdf.save(encrypted_path, encryption=pikepdf.Encryption(owner=password, user=password, R=6))
                                     
                                     final_file_path = encrypted_path
-                                    
                                 except Exception as e:
-                                    # st.warning(f"{person_name} 轉檔失敗 (保留 Word): {e}")
+                                    # st.warning(f"{person_name} 轉檔失敗: {e}")
                                     final_file_path = docx_path
                             
                             generated_files.append(final_file_path)
@@ -340,14 +425,15 @@ if reg_file and template_file:
                             
                         except Exception as e:
                             st.error(f"生成 {person_name} 時錯誤: {e}")
-                            if "expected token" in str(e): st.stop()
+                            if "expected token" in str(e):
+                                st.stop()
 
                         progress_bar.progress((i + 1) / total)
                         
                 finally:
-                    if is_windows and word_app:
+                    if word:
                         try:
-                            word_app.Quit()
+                            word.Quit()
                         except:
                             pass
                         pythoncom.CoUninitialize()
