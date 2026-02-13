@@ -287,8 +287,6 @@ if reg_file and template_file:
                     status = "Unmatched"
                     if row['Email_Norm'] in zoom_email_map:
                         status = "Matched (Email)"
-                    elif row['Name_Norm'] in zoom_name_map:
-                        status = "Matched (Name)"
                     
                     if "Matched" in status:
                         matched_list.append({
