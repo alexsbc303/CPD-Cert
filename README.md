@@ -1,80 +1,140 @@
 # HKIE CPD Certificate Generator
 
-This is a Streamlit application designed to automate the process of generating CPD (Continuing Professional Development) certificates for HKIE (The Hong Kong Institution of Engineers) events.
-
-It streamlines the workflow by fetching event details, verifying attendance against Zoom reports, and batch-generating encrypted PDF or Word certificates.
+A Streamlit-based web application for automating the generation of personalized CPD (Continuing Professional Development) certificates for HKIE (Hong Kong Institution of Engineers) events.
 
 ## Features
 
--   **Event Information Retrieval**: Automatically scrapes event title, date, and time from the HKIE ITD website URL.
--   **Attendance Verification**: Cross-checks the Registration list (Excel/CSV) against the Zoom Attendee Report to confirm actual attendance.
-    -   Supports matching by **Email** or **Name**.
-    -   Normalizes names (removes titles like Ir, Mr, Dr) for better matching accuracy.
--   **Batch Certificate Generation**:
-    -   Uses a Microsoft Word (`.docx`) template.
-    -   Supports placeholders for Name, Membership Number, Event Title, and Date/Time.
--   **Secure Output**:
-    -   Generates certificates in **Word (.docx)** or **PDF (.pdf)** format.
-    -   **PDF Encryption**: Automatically encrypts PDF files using the attendee's **Email Address** as the password.
--   **User-Friendly Interface**: Web-based UI built with Streamlit.
+- **Event Information Scraping**: Automatically fetch event details from HKIE website
+- **Flexible Data Import**: Support for CSV and Excel file formats
+- **Zoom Attendance Verification**: Cross-reference registration data with Zoom attendee reports
+- **Batch Certificate Generation**: Generate certificates for multiple attendees at once
+- **Multiple Output Formats**: 
+  - Word documents (.docx) - Unencrypted
+  - PDF files (.pdf) - Encrypted with attendee's email as password
+- **ZIP Packaging**: Download all generated certificates in a single ZIP file
 
-## Prerequisites
+## Requirements
 
--   **Operating System**: Windows (Required for PDF conversion via Microsoft Word COM automation).
--   **Software**: Microsoft Word must be installed on the machine running the script.
--   **Python**: Python 3.x
+### Python Packages
+streamlit pandas requests beautifulsoup4 docxtpl pikepdf pywin32 (Windows only)
+
+### System Requirements
+- **PDF Conversion**: Windows OS with Microsoft Word installed (for PDF export feature)
+- **Word Generation**: Cross-platform support (Windows, macOS, Linux)
 
 ## Installation
 
-1.  Clone the repository:
-    ```bash
-    git clone https://github.com/alexsbc303/HKIE-CPD-Cert.git
-    cd HKIE-CPD-Cert
-    ```
+1. Clone the repository:
+```bash
+git clone <repository-url>
+cd CPD-Cert
+```
 
-2.  Install the required Python packages:
-    ```bash
-    pip install -r requirements.txt
-    ```
-    *Common dependencies include: `streamlit`, `pandas`, `requests`, `beautifulsoup4`, `docxtpl`, `pikepdf`, `pywin32`.*
+2. Install dependencies:
+```bash 
+pip install streamlit pandas requests beautifulsoup4 docxtpl pikepdf
+```
+
+3. (Windows only) Install pywin32 for PDF conversion:
+```bash 
+pip install pywin32
+```
 
 ## Usage
 
-1.  **Start the Application**:
-    ```bash
-    streamlit run app.py
-    ```
+1. Run the application:
+```bash 
+streamlit run app.py
+```
+2. Follow the 4-step process in the web interface:
 
-2.  **Step 1: Get Event Info**:
-    -   Enter the HKIE event URL (e.g., `http://it.hkie.org.hk/...`).
-    -   Click **"抓取活動資訊" (Fetch Info)** to auto-fill the Event Title and Date/Time. You can also edit these manually.
+### Step 1: Get Event Information
 
-3.  **Step 2: Upload Files**:
-    -   **Registration File**: Upload the Excel/CSV file containing applicant details.
-        -   *Required Columns*: First Name, Last Name, Email.
-        -   *Optional Columns*: Membership No, Salutation.
-    -   **Certificate Template**: Upload the `.docx` template file.
-    -   **Zoom Report** (Optional): Upload the Zoom attendee report to verify attendance.
+- Enter the HKIE event URL
+- Click "Fetch Event Info" to automatically extract event title and details
+- Or manually enter the information
 
-4.  **Step 3: Process List**:
-    -   The app will map columns and cross-check attendees.
-    -   Review the preview of the matched list.
+### Step 2: Upload Files
 
-5.  **Step 4: Generate & Download**:
-    -   Select output format: **Word** or **PDF (Encrypted)**.
-    -   Click **"開始生成" (Start Generation)**.
-    -   Download the resulting `.zip` file containing all certificates.
+- __Registration Form__ (Required): Upload the registration Excel/CSV file
+- __Certificate Template__ (Required): Upload the Word template (.docx)
+- __Zoom Report__ (Optional): Upload Zoom attendee report for verification
 
-## Template Configuration
+### Step 3: Process Data
 
-The Word (`.docx`) template should use Jinja2-style placeholders:
+- The system automatically maps columns from the registration file
+- If Zoom verification is enabled, it matches attendees by email
+- Displays matched and unmatched records for review
 
--   `{{ name }}` : Attendee's full name (with Salutation).
--   `{{ membership_no }}` : HKIE Membership Number.
--   `{{ event_title }}` : Title of the event.
--   `{{ event_details }}` : Date and time of the event.
+### Step 4: Generate Certificates
+
+- Select output format (Word or encrypted PDF)
+- Click "Start Generation"
+- Download the ZIP file containing all certificates
+
+## Data Format Requirements
+
+### Registration File Columns
+
+The registration file should contain the following columns (auto-detected):
+
+- `First Name` or `名字`
+- `Last Name` or `姓氏`
+- `Email` or `電郵`
+- `Membership No` or `會員編號` (Optional)
+- `Salutation` or `稱呼` (Optional)
+
+### Word Template Variables
+
+Use these placeholders in your Word template:
+
+- `{{ name }}` - Full name with salutation
+- `{{ membership_no }}` - Membership number
+- `{{ event_title }}` - Event title
+- `{{ event_details }}` - Event date and time
+
+## Functions
+
+### `normalize_name(name)`
+
+Normalizes names for comparison by:
+
+- Converting to lowercase
+- Removing common titles (ir, mr, ms, miss, dr, prof)
+- Removing special characters
+- Collapsing multiple spaces
+
+### `parse_zoom_report(file_obj)`
+
+Parses Zoom attendee reports (CSV or Excel):
+
+- Detects "Attendee Details" section automatically
+- Handles trailing commas in CSV files
+- Aggregates total session time for attendees with multiple joins
+- Returns (DataFrame, error_message) tuple
 
 ## Notes
 
--   **PDF Generation**: The PDF conversion relies on `win32com` to control a local instance of Microsoft Word. This feature only works on Windows environments with Word installed.
--   **Encryption**: If PDF output is selected, files are encrypted using `pikepdf`. The password is set to the attendee's **Email Address**.
+- __Email Matching__: Zoom verification uses email addresses as the primary matching key
+- __PDF Encryption__: When generating PDFs, the attendee's email address is used as the password
+- __Membership Number__: If not found in the registration file, it will be left blank in the certificate
+- __Name Formatting__: The system automatically splits "Full Name" into "First Name" and "Last Name" if needed
+
+## Troubleshooting
+
+### "Cannot find Attendee Details section in Zoom report"
+
+- Ensure the Zoom report is in the standard format exported from Zoom
+- Check that the file contains "Attendee Details" or "User Name" column headers
+
+### PDF conversion not working
+
+- PDF export requires Windows OS with Microsoft Word installed
+- On other platforms, use the Word document format instead
+
+### Missing membership numbers
+
+- Verify that the registration file contains a column with "Membership" or "會員編號" in the header
+- The system will show a warning if this column is not found
+
+##

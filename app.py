@@ -315,7 +315,7 @@ if reg_file and template_file:
             if not df_final.empty:
                 st.success(f"共產生 {len(df_final)} 筆證書名單。")
                 # 顯示前幾筆資料供檢查
-                st.write("預覽將生成的資料 (請確認 Membership No 是否有值):")
+                st.write("預覽將生成的資料 (請確認 Email 是否有值):")
                 st.dataframe(df_final[['Salutation', 'Full Name', 'Membership No', 'Email']].head())
             else:
                 st.warning("沒有符合的名單。")
@@ -328,7 +328,7 @@ if reg_file and template_file:
     
     output_format = st.radio(
         "選擇輸出格式：",
-        ('Word 文件 (.docx) - 不加密', 'PDF 文件 (.pdf) - 加密 (密碼: Membership No.)')
+        ('Word 文件 (.docx) - 不加密', 'PDF 文件 (.pdf) - 加密 (密碼: Email)')
     )
     
     if st.button("開始生成"):
@@ -405,7 +405,7 @@ if reg_file and template_file:
                                     wb_doc.SaveAs(os.path.abspath(pdf_path), FileFormat=17)
                                     wb_doc.Close(SaveChanges=False)
                                     
-                                    password = str(person['Membership No']).strip()
+                                    password = str(person['Email']).strip()
                                     if not password or password == 'nan':
                                         password = "hkie"
                                         
